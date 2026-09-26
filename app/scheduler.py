@@ -2585,7 +2585,11 @@ def gpu_usage(
 
     * finished jobs (COMPLETED/CANCELLED while RUNNING): ``scheduled_at`` to
       ``completed_at``;
-    * still-RUNNING jobs: ``scheduled_at`` truncated to the query cutoff.
+    * still-RUNNING jobs: ``scheduled_at`` to the earlier of ``end`` and the
+      server's current UTC instant — the request's statistical cutoff,
+      captured once per call. Time that has not happened yet never counts:
+      a window lying entirely in the future reports zero, and a window
+      straddling "now" only accrues its already-elapsed part.
 
     QUEUED jobs have never run and never contribute. Intervals intersect the
     query window left-closed/right-open, so a job starting exactly at ``end``
@@ -2600,6 +2604,12 @@ def gpu_usage(
     end = _as_utc(end)
     if end <= start:
         raise SchedulerError("end must be later than start (UTC)")
+
+    # Statistical cutoff for this request: the server's current UTC instant,
+    # captured once. Nothing past it has happened yet, so still-RUNNING
+    # intervals end at the earlier of ``end`` and this instant; global and
+    # per-tenant aggregates therefore share exactly the same cutoff.
+    cutoff = _now_utc()
 
     with db.get_lock():
         conn = db.get_conn()
@@ -2623,8 +2633,10 @@ def gpu_usage(
             for r in tenant_rows
         }
 
-        # Only jobs that actually entered RUNNING state: their RUNNING interval
-        # is [scheduled_at, completed_at), truncated to the query cutoff.
+        # Only jobs that actually entered RUNNING state: finished jobs span
+        # [scheduled_at, completed_at); still-RUNNING jobs span from
+        # scheduled_at to the earlier of the window end and the request
+        # cutoff, never into the future.
         rows = conn.execute(
             """SELECT id, tenant_id, gpus, status,
                       scheduled_at, completed_at
@@ -2642,9 +2654,10 @@ def gpu_usage(
             if r["completed_at"] is not None:
                 ran_end = _parse_iso(r["completed_at"])
             else:
-                # Still RUNNING: the run is assumed to extend to the query
-                # cutoff, never beyond it.
-                ran_end = end
+                # Still RUNNING: the run extends only up to this request's
+                # statistical cutoff — the not-yet-happened remainder of the
+                # window (min with end, below) contributes no usage.
+                ran_end = cutoff
 
             lo = max(ran_start, start)
             hi = min(ran_end, end)

@@ -478,6 +478,87 @@ def test_gpu_usage_still_running_truncated_at_cutoff(conn):
     assert tenants["a"]["gpu_minutes"] == pytest.approx(60.0)  # 3 x 20
 
 
+def test_gpu_usage_running_job_never_counts_future_time(conn):
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    j = dispatch("a", 2, 10)
+    # RUNNING since 30 min ago in real server time.
+    db.get_conn().execute(
+        "UPDATE jobs SET scheduled_at = ? WHERE id = ?",
+        ((now - timedelta(minutes=30)).isoformat(), j["id"]))
+
+    # Window entirely in the future: nothing has happened there yet.
+    r = scheduler.gpu_usage(
+        now + timedelta(hours=1), now + timedelta(hours=2))
+    tenants = {t["tenant_id"]: t for t in r["tenants"]}
+    assert tenants["a"] == {
+        "tenant_id": "a", "gpu_minutes": 0.0, "overlapping_jobs": 0}
+    assert r["global"] == {"gpu_minutes": 0.0, "overlapping_jobs": 0}
+
+    # Window straddling "now": only the already-elapsed part counts
+    # (2 GPUs x ~30 elapsed minutes, not the full 2-hour window).
+    r = scheduler.gpu_usage(
+        now - timedelta(hours=1), now + timedelta(hours=1))
+    tenants = {t["tenant_id"]: t for t in r["tenants"]}
+    assert tenants["a"]["gpu_minutes"] == pytest.approx(60.0, abs=0.5)
+    assert tenants["a"]["overlapping_jobs"] == 1
+    assert r["global"]["gpu_minutes"] == pytest.approx(60.0, abs=0.5)
+    assert r["global"]["overlapping_jobs"] == 1
+
+
+def test_gpu_usage_future_window_tenant_filter_consistent(conn):
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    ja = dispatch("a", 2, 10)
+    jb = dispatch("b", 4, 10)
+    started = (now - timedelta(minutes=30)).isoformat()
+    conn.execute(
+        "UPDATE jobs SET scheduled_at = ? WHERE id IN (?, ?)",
+        (started, ja["id"], jb["id"]))
+
+    start, end = now + timedelta(days=1), now + timedelta(days=1, hours=1)
+    r = scheduler.gpu_usage(start, end, tenant_id="a")
+    assert r["tenant_id"] == "a"
+    assert [t["tenant_id"] for t in r["tenants"]] == ["a"]
+    # Filtered tenant and its global aggregate are both zero in the future.
+    assert r["tenants"][0]["gpu_minutes"] == 0.0
+    assert r["tenants"][0]["overlapping_jobs"] == 0
+    assert r["global"] == {"gpu_minutes": 0.0, "overlapping_jobs": 0}
+
+    # Unfiltered view agrees: every tenant zero, global zero.
+    r = scheduler.gpu_usage(start, end)
+    assert all(t["gpu_minutes"] == 0.0 for t in r["tenants"])
+    assert r["global"] == {"gpu_minutes": 0.0, "overlapping_jobs": 0}
+
+
+def test_gpu_usage_finished_job_unaffected_by_cutoff(conn):
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    j = dispatch("a", 2, 10)
+    # Finished run fully in the past: [now-60m, now-30m).
+    db.get_conn().execute(
+        "UPDATE jobs SET scheduled_at = ?, completed_at = ?, "
+        "status = 'COMPLETED' WHERE id = ?",
+        ((now - timedelta(minutes=60)).isoformat(),
+         (now - timedelta(minutes=30)).isoformat(), j["id"]))
+
+    # A straddling window still counts the finished run in full: the cutoff
+    # only caps still-RUNNING jobs, never completed_at.
+    r = scheduler.gpu_usage(
+        now - timedelta(hours=2), now + timedelta(hours=2))
+    tenants = {t["tenant_id"]: t for t in r["tenants"]}
+    assert tenants["a"]["gpu_minutes"] == pytest.approx(60.0)  # 2 x 30
+    assert tenants["a"]["overlapping_jobs"] == 1
+
+    # A future window contains none of it.
+    r = scheduler.gpu_usage(
+        now + timedelta(hours=1), now + timedelta(hours=2))
+    assert r["global"] == {"gpu_minutes": 0.0, "overlapping_jobs": 0}
+
+
 def test_gpu_usage_excludes_queued_jobs(conn):
     run = dispatch("b", 1, 20)
     set_interval(run["id"], 0, 20)

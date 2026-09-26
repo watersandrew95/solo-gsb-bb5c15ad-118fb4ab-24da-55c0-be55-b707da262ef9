@@ -316,6 +316,56 @@ def test_gpu_usage_empty_database_zeros(client):
     assert body["global"] == {"gpu_minutes": 0.0, "overlapping_jobs": 0}
 
 
+def test_gpu_usage_future_window_not_inflated_via_http(client):
+    from datetime import datetime, timedelta, timezone
+
+    from app import db
+
+    # A still-RUNNING job started 30 min ago (real server time).
+    j = client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 2, "duration_min": 30}).json()["id"]
+    client.post("/scheduler/batch")
+    now = datetime.now(timezone.utc)
+    db.get_conn().execute(
+        "UPDATE jobs SET scheduled_at = ? WHERE id = ?",
+        ((now - timedelta(minutes=30)).isoformat(), j))
+
+    # Querying tomorrow must not project the run into the future.
+    r = client.get("/usage/gpu", params={
+        "start": (now + timedelta(days=1)).isoformat(),
+        "end": (now + timedelta(days=1, hours=1)).isoformat()})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["global"] == {"gpu_minutes": 0.0, "overlapping_jobs": 0}
+    tenants = {t["tenant_id"]: t for t in body["tenants"]}
+    assert tenants["team-a"] == {
+        "tenant_id": "team-a", "gpu_minutes": 0.0, "overlapping_jobs": 0}
+
+    # A window straddling "now" only accrues the elapsed part (~30 min),
+    # consistently for the tenant row and the global aggregate.
+    r = client.get("/usage/gpu", params={
+        "start": (now - timedelta(hours=1)).isoformat(),
+        "end": (now + timedelta(hours=1)).isoformat()})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    tenants = {t["tenant_id"]: t for t in body["tenants"]}
+    assert tenants["team-a"]["gpu_minutes"] == pytest.approx(60.0, abs=0.5)
+    assert tenants["team-a"]["overlapping_jobs"] == 1
+    assert body["global"]["gpu_minutes"] == pytest.approx(60.0, abs=0.5)
+    assert body["global"]["overlapping_jobs"] == 1
+
+    # Same cutoff under the tenant filter.
+    r = client.get("/usage/gpu", params={
+        "start": (now + timedelta(days=1)).isoformat(),
+        "end": (now + timedelta(days=1, hours=1)).isoformat(),
+        "tenant_id": "team-a"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["global"] == {"gpu_minutes": 0.0, "overlapping_jobs": 0}
+    assert body["tenants"] == [{
+        "tenant_id": "team-a", "gpu_minutes": 0.0, "overlapping_jobs": 0}]
+
+
 def test_tenant_gpu_cap_flow_via_http(client):
     # Create tenant with a 2-GPU concurrent cap.
     r = client.post("/tenants", json={

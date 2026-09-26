@@ -819,7 +819,7 @@ curl "http://localhost:8000/ledger?tenant_id=team-a&limit=200"  # AGING/QUANTUM/
 
 - 用量来自作业的**实际 RUNNING 区间**，而非提交时的 `duration_min` 估算：
   - **已结束作业**（`COMPLETED`，或运行中被 `CANCELLED`）：`scheduled_at → completed_at`；
-  - **仍在运行的作业**：`scheduled_at` 起算，**截断到查询截止时刻 `end`**（不假设作业在未来仍持续）。
+  - **仍在运行的作业**：`scheduled_at` 起算，**截断到 `end` 与服务器当前 UTC 时刻中较早者**（不假设作业在未来仍持续）。服务器当前时刻是每次请求取一次的**统计截止点**：完全落在未来的时间窗返回零用量，跨过当前时刻的时间窗只累计已发生部分。
 - 与查询区间按左闭右开求交：作业恰好在 `end` 才启动、或恰好在 `start` 结束，用量均为 **0**。
 - **QUEUED 作业不计入**（从未占用 GPU）；排队期间被取消的作业同样不计。
 - 用量 = `gpus × 交集分钟数`；`overlapping_jobs` 为 RUNNING 区间与时间窗有非空交集的作业数（不是 GPU 数）。

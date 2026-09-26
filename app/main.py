@@ -581,8 +581,11 @@ def get_gpu_usage(
     """Per-tenant and global GPU-minutes over a [start, end) UTC window.
 
     Usage derives from actual RUNNING intervals: finished jobs use
-    scheduled_at -> completed_at, still-RUNNING jobs are truncated to ``end``.
-    QUEUED jobs never count. Returns 400 when end is not later than start.
+    scheduled_at -> completed_at; still-RUNNING jobs end at the earlier of
+    ``end`` and the server's current UTC instant (the request's statistical
+    cutoff), so time that has not happened yet — including windows lying
+    entirely in the future — contributes nothing. QUEUED jobs never count.
+    Returns 400 when end is not later than start.
     """
     try:
         return scheduler.gpu_usage(start=start, end=end, tenant_id=tenant_id)
