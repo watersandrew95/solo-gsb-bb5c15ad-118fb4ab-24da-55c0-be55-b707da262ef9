@@ -316,6 +316,125 @@ def test_gpu_usage_empty_database_zeros(client):
     assert body["global"] == {"gpu_minutes": 0.0, "overlapping_jobs": 0}
 
 
+def test_gpu_usage_future_window_not_counted(client):
+    """A still-RUNNING job must not be extrapolated past the server's 'now':
+    windows entirely in the future report zero, and windows straddling 'now'
+    only accumulate the part that has already elapsed."""
+    from datetime import datetime, timedelta, timezone
+
+    from app import db
+
+    j1 = client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 2, "duration_min": 30}).json()["id"]
+    j2 = client.post("/jobs", json={
+        "tenant_id": "team-b", "gpus": 4, "duration_min": 60}).json()["id"]
+    client.post("/scheduler/batch")
+
+    # Pin both RUNNING intervals to an exact start 30 minutes ago.
+    now = datetime.now(timezone.utc)
+    started = (now - timedelta(minutes=30)).isoformat()
+    conn = db.get_conn()
+    conn.execute("UPDATE jobs SET scheduled_at = ?", (started,))
+
+    def fmt(dt):
+        return dt.isoformat()
+
+    # A window entirely in the future: nothing has happened there yet, so
+    # neither gpu_minutes nor overlapping_jobs may be reported — globally,
+    # per tenant, and under a tenant filter.
+    future = {"start": fmt(now + timedelta(days=1)),
+              "end": fmt(now + timedelta(days=2))}
+    r = client.get("/usage/gpu", params=future)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["global"] == {"gpu_minutes": 0.0, "overlapping_jobs": 0}
+    assert {t["tenant_id"] for t in body["tenants"]} == {"team-a", "team-b"}
+    for t in body["tenants"]:
+        assert t["gpu_minutes"] == 0.0
+        assert t["overlapping_jobs"] == 0
+
+    r = client.get("/usage/gpu", params={**future, "tenant_id": "team-a"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["global"] == {"gpu_minutes": 0.0, "overlapping_jobs": 0}
+    assert body["tenants"] == [
+        {"tenant_id": "team-a", "gpu_minutes": 0.0, "overlapping_jobs": 0}]
+
+    # A window straddling "now" only accumulates the elapsed part: each job
+    # has been running for ~30 minutes, the rest of the window is future.
+    r = client.get("/usage/gpu", params={
+        "start": fmt(now - timedelta(hours=1)),
+        "end": fmt(now + timedelta(days=1))})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    tenants = {t["tenant_id"]: t for t in body["tenants"]}
+    assert tenants["team-a"]["gpu_minutes"] == pytest.approx(2 * 30, abs=0.5)
+    assert tenants["team-a"]["overlapping_jobs"] == 1
+    assert tenants["team-b"]["gpu_minutes"] == pytest.approx(4 * 30, abs=0.5)
+    assert tenants["team-b"]["overlapping_jobs"] == 1
+    # Global totals stay consistent with the per-tenant breakdown.
+    assert body["global"]["gpu_minutes"] == pytest.approx(
+        sum(t["gpu_minutes"] for t in body["tenants"]), abs=1e-6)
+    assert body["global"]["overlapping_jobs"] == 2
+
+    # The tenant-filtered view of the same straddling window agrees.
+    r = client.get("/usage/gpu", params={
+        "start": fmt(now - timedelta(hours=1)),
+        "end": fmt(now + timedelta(days=1)),
+        "tenant_id": "team-b"})
+    body = r.json()
+    assert body["global"]["gpu_minutes"] == pytest.approx(4 * 30, abs=0.5)
+    assert body["global"]["overlapping_jobs"] == 1
+
+
+def test_gpu_usage_completed_job_with_future_window_end(client):
+    """Finished jobs still end at completed_at even when the query window
+    extends into the future; only the still-RUNNING job is cut off at 'now'."""
+    from datetime import datetime, timedelta, timezone
+
+    from app import db
+
+    j1 = client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 2, "duration_min": 30}).json()["id"]
+    j2 = client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 1, "duration_min": 30}).json()["id"]
+    client.post("/scheduler/batch")
+
+    now = datetime.now(timezone.utc)
+    conn = db.get_conn()
+    # j1 ran [now-60m, now-30m) and finished; j2 started 30 minutes ago and
+    # is still RUNNING.
+    conn.execute(
+        "UPDATE jobs SET scheduled_at = ?, status = 'COMPLETED',"
+        " completed_at = ? WHERE id = ?",
+        ((now - timedelta(minutes=60)).isoformat(),
+         (now - timedelta(minutes=30)).isoformat(), j1))
+    conn.execute(
+        "UPDATE jobs SET scheduled_at = ? WHERE id = ?",
+        ((now - timedelta(minutes=30)).isoformat(), j2))
+
+    r = client.get("/usage/gpu", params={
+        "start": (now - timedelta(hours=2)).isoformat(),
+        "end": (now + timedelta(days=1)).isoformat()})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # j1: 2 x 30 = 60 (completed_at, unaffected by the future window end);
+    # j2: 1 x ~30 (cut off at 'now', not extrapolated to end).
+    assert body["global"]["gpu_minutes"] == pytest.approx(60 + 30, abs=0.5)
+    assert body["global"]["overlapping_jobs"] == 2
+    assert body["tenants"] == [{
+        "tenant_id": "team-a",
+        "gpu_minutes": body["global"]["gpu_minutes"],
+        "overlapping_jobs": 2}]
+
+    # A window covering only the future part of j2's would-be run still
+    # reports zero for it.
+    r = client.get("/usage/gpu", params={
+        "start": (now + timedelta(hours=1)).isoformat(),
+        "end": (now + timedelta(hours=2)).isoformat()})
+    assert r.json()["global"] == {"gpu_minutes": 0.0, "overlapping_jobs": 0}
+
+
 def test_tenant_gpu_cap_flow_via_http(client):
     # Create tenant with a 2-GPU concurrent cap.
     r = client.post("/tenants", json={

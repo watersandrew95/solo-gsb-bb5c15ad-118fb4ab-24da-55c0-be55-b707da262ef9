@@ -817,9 +817,14 @@ curl "http://localhost:8000/ledger?tenant_id=team-a&limit=200"  # AGING/QUANTUM/
 
 按 UTC 时间窗 `[start, end)`（**左闭右开**）汇总每租户与全局的实际 GPU 用量：
 
-- 用量来自作业的**实际 RUNNING 区间**，而非提交时的 `duration_min` 估算：
+- 用量来自作业的**实际 RUNNING 区间**，而非提交时的 `duration_min` 估算；统计只计到
+  **本次请求的服务器当前 UTC 时刻**（统计截止点，一次请求内取定一次，全局与各租户
+  汇总共用同一截止点）为止：
   - **已结束作业**（`COMPLETED`，或运行中被 `CANCELLED`）：`scheduled_at → completed_at`；
-  - **仍在运行的作业**：`scheduled_at` 起算，**截断到查询截止时刻 `end`**（不假设作业在未来仍持续）。
+  - **仍在运行的作业**：`scheduled_at` 起算，结束于**查询截止时刻 `end` 与统计截止点中
+    较早者**（不假设作业在未来仍持续）。
+- **未来尚未发生的部分不计入**：整个窗口都在未来时 `gpu_minutes` 与
+  `overlapping_jobs` 均为 0；窗口跨过当前时刻时只累计已发生的部分。
 - 与查询区间按左闭右开求交：作业恰好在 `end` 才启动、或恰好在 `start` 结束，用量均为 **0**。
 - **QUEUED 作业不计入**（从未占用 GPU）；排队期间被取消的作业同样不计。
 - 用量 = `gpus × 交集分钟数`；`overlapping_jobs` 为 RUNNING 区间与时间窗有非空交集的作业数（不是 GPU 数）。

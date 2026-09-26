@@ -473,7 +473,8 @@ def test_gpu_usage_still_running_truncated_at_cutoff(conn):
     assert tenants["a"]["gpu_minutes"] == 0.0
     assert tenants["a"]["overlapping_jobs"] == 0
 
-    # Window entirely after the start: run assumed ongoing until the cutoff.
+    # Window entirely after the start (still in the past): the run is
+    # ongoing, so it covers the window up to the cutoff.
     _, tenants = usage_tenants(60, 80)
     assert tenants["a"]["gpu_minutes"] == pytest.approx(60.0)  # 3 x 20
 
@@ -549,6 +550,33 @@ def test_gpu_usage_naive_datetimes_treated_as_utc(conn):
         datetime(2026, 1, 1, 0, 10), datetime(2026, 1, 1, 1, 0))
     aware, _ = usage_tenants(10, 60)
     assert naive["global"] == aware["global"]
+
+
+def test_gpu_usage_running_job_not_extrapolated_into_future(conn):
+    """The statistics cutoff is the server's current UTC instant: a still-
+    RUNNING job's interval ends at min(query end, now), so the future part
+    of a window never contributes gpu_minutes or overlapping_jobs."""
+    from datetime import datetime, timedelta, timezone
+
+    j = dispatch("a", 2, 10)
+    now = datetime.now(timezone.utc)
+    conn.execute(
+        "UPDATE jobs SET scheduled_at = ? WHERE id = ?",
+        ((now - timedelta(minutes=30)).isoformat(), j["id"]))
+
+    # Window entirely in the future: nothing has happened there yet.
+    r = scheduler.gpu_usage(now + timedelta(days=1), now + timedelta(days=2))
+    assert r["global"] == {"gpu_minutes": 0.0, "overlapping_jobs": 0}
+    assert r["tenants"] == [
+        {"tenant_id": "a", "gpu_minutes": 0.0, "overlapping_jobs": 0}]
+
+    # Window straddling "now": only the elapsed ~30 minutes count, and the
+    # per-tenant figure matches the global one for the single tenant.
+    r = scheduler.gpu_usage(now - timedelta(hours=1), now + timedelta(days=1))
+    assert r["global"]["gpu_minutes"] == pytest.approx(2 * 30, abs=0.5)
+    assert r["global"]["overlapping_jobs"] == 1
+    assert r["tenants"][0]["gpu_minutes"] == r["global"]["gpu_minutes"]
+    assert r["tenants"][0]["overlapping_jobs"] == 1
 
 
 # ---------------------------------------------------------------------------

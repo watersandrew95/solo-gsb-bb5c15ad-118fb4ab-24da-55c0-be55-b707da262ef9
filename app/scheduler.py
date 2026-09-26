@@ -2585,11 +2585,16 @@ def gpu_usage(
 
     * finished jobs (COMPLETED/CANCELLED while RUNNING): ``scheduled_at`` to
       ``completed_at``;
-    * still-RUNNING jobs: ``scheduled_at`` truncated to the query cutoff.
+    * still-RUNNING jobs: ``scheduled_at`` to the *statistics cutoff* — the
+      server's current UTC instant, captured once per request — so the
+      interval ends at the earlier of the query cutoff ``end`` and that
+      instant. Time that has not happened yet never contributes.
 
     QUEUED jobs have never run and never contribute. Intervals intersect the
     query window left-closed/right-open, so a job starting exactly at ``end``
-    or ending exactly at ``start`` contributes nothing.
+    or ending exactly at ``start`` contributes nothing. A window lying
+    entirely in the future therefore reports zero, and a window straddling
+    "now" only accumulates the part that has already elapsed.
 
     Returns per-tenant and global GPU-minutes (``gpus`` times the intersected
     duration in minutes) plus the number of overlapping RUNNING intervals.
@@ -2600,6 +2605,10 @@ def gpu_usage(
     end = _as_utc(end)
     if end <= start:
         raise SchedulerError("end must be later than start (UTC)")
+
+    # Statistics cutoff: the server's current UTC instant, captured once so
+    # the whole request is evaluated against a single consistent "now".
+    now = _now_utc()
 
     with db.get_lock():
         conn = db.get_conn()
@@ -2623,8 +2632,10 @@ def gpu_usage(
             for r in tenant_rows
         }
 
-        # Only jobs that actually entered RUNNING state: their RUNNING interval
-        # is [scheduled_at, completed_at), truncated to the query cutoff.
+        # Only jobs that actually entered RUNNING state: their RUNNING
+        # interval is [scheduled_at, completed_at); a still-RUNNING job's
+        # interval ends at the earlier of the query cutoff and ``now``, so
+        # the future part of the window is never counted.
         rows = conn.execute(
             """SELECT id, tenant_id, gpus, status,
                       scheduled_at, completed_at
@@ -2642,9 +2653,11 @@ def gpu_usage(
             if r["completed_at"] is not None:
                 ran_end = _parse_iso(r["completed_at"])
             else:
-                # Still RUNNING: the run is assumed to extend to the query
-                # cutoff, never beyond it.
-                ran_end = end
+                # Still RUNNING: the run is only known up to the statistics
+                # cutoff (the server's "now" for this request); it ends at
+                # the earlier of the query cutoff and that instant, and is
+                # never extrapolated into the future.
+                ran_end = min(end, now)
 
             lo = max(ran_start, start)
             hi = min(ran_end, end)
